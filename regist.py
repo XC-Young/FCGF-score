@@ -150,8 +150,8 @@ class estimator:
                         if single_trans['inlier_ratio'] > top_trans[i]['inlier_ratio']:
                             top_trans[i] = single_trans
                             break
-                top_trans = sorted(top_trans, key=lambda x:x["inlier_ratio"], reverse=True)
-                np.savez(f'{Save_dir}/{id0}-{id1}.npz',top_trans=top_trans)
+            top_trans = sorted(top_trans, key=lambda x:x["inlier_ratio"], reverse=True)
+            np.savez(f'{Save_dir}/{id0}-{id1}.npz',top_trans=top_trans)
         else:
             while iter_cal<self.cfg.max_iter:
                 iter_cal += 1
@@ -181,7 +181,7 @@ class estimator:
     def RANSAC(self,dataset):
         match_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/match_{self.cfg.keynum}'
         if self.cfg.score:
-            Save_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/top_trans'
+            Save_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/ir_top_trans'
         else:
             Save_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/trans'
         make_non_exists_dir(Save_dir)
@@ -241,8 +241,8 @@ class score:
         return(collated_dict)
 
     def score(self, dataset):
-        Save_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/top_trans'
-        trans_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/score_trans'
+        Save_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/ir_top_trans'
+        trans_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/score_top_trans'
         make_non_exists_dir(trans_dir)
         for pair in tqdm(dataset.pair_ids):
             id0,id1=pair
@@ -263,7 +263,29 @@ class score:
             data_dict['ref_points'] = pcd0.astype(np.float32)
             data_dict['ref_feats'] = np.ones((pcd0.shape[0], 1), dtype=np.float32)
             data_dict['src_feats'] = np.ones((pcd1.shape[0], 1), dtype=np.float32)
-            score = 0
+            new_top_trans = []
+            for i in range(len(top_trans)):
+                single_trans = {
+                    'trans':[],
+                    'score':float,
+                    'ir':float}
+                trans = top_trans[i]['trans']
+                overlap = top_trans[i]['inlier_ratio']
+                pcd1 = transform_points(pcd1,trans)
+                data_dict['src_points'] = pcd1.astype(np.float32)
+                collated_dict = self.dict_pre(data_dict)
+                collated_dict = to_cuda(collated_dict)
+                cls_logits = self.model(collated_dict)
+                score = torch.sigmoid(cls_logits).detach().cpu().item()
+                torch.cuda.empty_cache()
+                pcd1 = transform_points(pcd1, np.linalg.inv(trans))
+                single_trans['trans'] = trans
+                single_trans['score'] = score
+                single_trans['ir'] = overlap
+                new_top_trans.append(single_trans)
+            new_top_trans = sorted(new_top_trans, key=lambda x:x["score"], reverse=True)
+            np.savez(f'{trans_dir}/{id0}-{id1}.npz',top_trans=new_top_trans)
+            """ score = 0
             iter_time = 0
             trans_idx = 0
             save_trans = np.eye(4)
@@ -290,7 +312,7 @@ class score:
                     save_score = score
                 pcd1 = transform_points(pcd1, np.linalg.inv(trans))
                 iter_time += 1
-            np.savez(f'{trans_dir}/{id0}-{id1}.npz', trans=save_trans, overlap=overlap, score=save_score, iter_time=iter_time)
+            np.savez(f'{trans_dir}/{id0}-{id1}.npz', trans=save_trans, overlap=overlap, score=save_score, iter_time=iter_time) """
 
 
 class evaluator:
@@ -322,6 +344,34 @@ class evaluator:
         FMR=np.mean(pair_fmrs>ratio)                                #FMR in one scene
         return FMR, pair_fmrs
 
+class calerror:
+    def __init__(self,cfg):
+        self.cfg = cfg
+
+    def transdiff(self,gt,pre):
+        Rdiff = compute_R_diff(gt[0:3:,0:3:],pre[0:3:,0:3:])
+        tdiff = np.sqrt(np.sum(np.square(gt[0:3,3]-pre[0:3,3])))
+        return Rdiff,tdiff
+    
+    def error_cal(self,dataset,top_trans_dir):
+        scene_rre,scene_rte = [],[]
+        for pair in tqdm(dataset.pair_ids):
+            id0,id1 = pair
+            top_trans = np.load(f'{top_trans_dir}/{id0}-{id1}.npz',allow_pickle=True)['top_trans']
+            gt = dataset.get_transform(id0,id1)
+            top_rre,top_rte = [],[]
+            for i in range(len(top_trans)):
+                trans = top_trans[i]['trans']
+                Rdiff,tdiff = self.transdiff(gt,trans)
+                top_rre.append(Rdiff)
+                top_rte.append(tdiff)
+            scene_rre.append(top_rre)
+            scene_rte.append(top_rte)
+        scene_rre = np.array(scene_rre) #n,top_num
+        scene_rte = np.array(scene_rte)
+        rre = np.mean(scene_rre,axis=0)
+        rte = np.mean(scene_rte,axis=0)
+        return rre,rte
 
 parser = argparse.ArgumentParser()
 # registration parses
@@ -349,35 +399,62 @@ estmtor = estimator(config)
 evaltor = evaluator(config)
 if config.score:
     scorer = score(config)
+errorcal = calerror(config)
+
 datasets = get_dataset_name(config.dataset,config.origin_data_dir)
 FMRS=[]
 all_pair_fmrs=[]
-for scene,dataset in tqdm(datasets.items()):
-    if scene=='wholesetname':continue
-    if scene=='valscenes':continue
-    matcer.run(dataset)
-    estmtor.RANSAC(dataset)
-    if config.score:
-        print('Using Scorer-geo to keep the best transformation.')
+make_non_exists_dir(f'{config.output_cache_fn}/{config.dataset}')
+error_fn = f'{config.output_cache_fn}/{config.dataset}/{config.dataset}_error.log'
+writer = open(error_fn,'w')
+ir_rre,ir_rte = [],[]
+score_rre,score_rte = [],[]
+if config.score:
+    for scene,dataset in tqdm(datasets.items()):
+        if scene=='wholesetname':continue
+        if scene=='valscenes':continue
+        matcer.run(dataset)
+        estmtor.RANSAC(dataset)
+        print('Using Scorer-geo to score transformations.')
         scorer.score(dataset)
-        R_pre_log(dataset,f'{config.output_cache_fn}/{dataset.name}/score_trans')
-    else:
+        ir_trans_dir = f'{config.output_cache_fn}/{dataset.name}/ir_top_trans'
+        score_trans_dir = f'{config.output_cache_fn}/{dataset.name}/score_top_trans'
+        ir_scene_rre,ir_scene_rte = errorcal.error_cal(dataset,ir_trans_dir)
+        score_scene_rre,score_scene_rte = errorcal.error_cal(dataset,score_trans_dir)
+        ir_rre.append(ir_scene_rre)
+        ir_rte.append(ir_scene_rte)
+        score_rre.append(score_scene_rre)
+        score_rte.append(score_scene_rte)
+    ir_rre = np.mean(np.array(ir_rre),axis=0)
+    ir_rte = np.mean(np.array(ir_rte),axis=0)
+    score_rre = np.mean(np.array(score_rre),axis=0)
+    score_rte = np.mean(np.array(score_rte),axis=0)
+    writer.write(f'ir_rre\tir_rte\tscore_rre\tscore_rte\n')
+    for i in range(ir_rre.shape[0]):
+        writer.write(f'{ir_rre[i]}\t{ir_rte[i]}\t{score_rre[i]}\t{score_rte[i]}\n')
+    writer.close()
+else:
+    for scene,dataset in tqdm(datasets.items()):
+        if scene=='wholesetname':continue
+        if scene=='valscenes':continue
+        matcer.run(dataset)
+        estmtor.RANSAC(dataset)
         R_pre_log(dataset,f'{config.output_cache_fn}/{dataset.name}/trans')
-    print(f'eval the FMR result on {dataset.name}')
-    FMR,pair_fmrs=evaltor.Feature_match_Recall(dataset,ratio=config.fmr_ratio)
-    FMRS.append(FMR)
-    all_pair_fmrs.append(pair_fmrs)
-FMRS=np.array(FMRS)
-all_pair_fmrs=np.concatenate(all_pair_fmrs,axis=0)
-#RR
-datasetname=datasets['wholesetname']
-Mean_Registration_Recall,c_flags,c_errors=RR_cal.benchmark(config,datasets,config.max_iter)
-#print and save:
-msg=f'{datasetname}-{config.max_iter}iterations\n'
-msg+=f'correct ratio avg {np.mean(all_pair_fmrs):.5f}\n' \
-    f'correct ratio>0.05 avg {np.mean(FMRS):.5f}  std {np.std(FMRS):.5f}\n' \
-    f'Mean_Registration_Recall {Mean_Registration_Recall}\n'
+        print(f'eval the FMR result on {dataset.name}')
+        FMR,pair_fmrs=evaltor.Feature_match_Recall(dataset,ratio=config.fmr_ratio)
+        FMRS.append(FMR)
+        all_pair_fmrs.append(pair_fmrs)
+    FMRS=np.array(FMRS)
+    all_pair_fmrs=np.concatenate(all_pair_fmrs,axis=0)
+    #RR
+    datasetname=datasets['wholesetname']
+    Mean_Registration_Recall,c_flags,c_errors=RR_cal.benchmark(config,datasets,config.max_iter)
+    #print and save:
+    msg=f'{datasetname}-{config.max_iter}iterations\n'
+    msg+=f'correct ratio avg {np.mean(all_pair_fmrs):.5f}\n' \
+        f'correct ratio>0.05 avg {np.mean(FMRS):.5f}  std {np.std(FMRS):.5f}\n' \
+        f'Mean_Registration_Recall {Mean_Registration_Recall}\n'
 
-with open('data/results.log','a') as f:
-    f.write(msg+'\n')
-print(msg)
+    with open('data/results.log','a') as f:
+        f.write(msg+'\n')
+    print(msg)
