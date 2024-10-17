@@ -170,12 +170,12 @@ class estimator:
             if Rdiff<self.cfg.label_R_th and tdiff<self.cfg.label_t_th:
                 label = 1
             np.savez(f'{Save_dir}/{id0}-{id1}.npz',trans = best_trans, ir = best_ir, label = label)     
-            ir0 = Keys_m0[best_ir_idx]
+            """ ir0 = Keys_m0[best_ir_idx]
             ir_ply0 = make_open3d_point_cloud(ir0)
             ir1 = Keys_m1[best_ir_idx]
             ir_ply1 = make_open3d_point_cloud(ir1)
             o3d.io.write_point_cloud(f'{Save_dir}/{id0}-{id1}-ir0.ply',ir_ply0)
-            o3d.io.write_point_cloud(f'{Save_dir}/{id0}-{id1}-ir1.ply',ir_ply1)
+            o3d.io.write_point_cloud(f'{Save_dir}/{id0}-{id1}-ir1.ply',ir_ply1) """
 
      
     def RANSAC(self,dataset):
@@ -210,7 +210,7 @@ class score:
     def __init__(self,cfg):
         self.cfg = cfg
         self.point_limit = 30000
-        self.neighbor_limits = np.array([41, 36, 34, 16])
+        self.neighbor_limits = np.array([41, 36, 34, 15])
         model_cfg = make_cfg()
         self.model = create_model(model_cfg).cuda()
         load_snapshot(self.model,self.cfg.weight)
@@ -246,6 +246,7 @@ class score:
         make_non_exists_dir(trans_dir)
         for pair in tqdm(dataset.pair_ids):
             id0,id1=pair
+            if os.path.exists(f'{trans_dir}/{id0}-{id1}.npz'):continue
             top_trans = np.load(f'{Save_dir}/{id0}-{id1}.npz',allow_pickle=True)['top_trans']
             pcd0 = dataset.get_pc_o3d(id0)
             pcd0 = pcd0.voxel_down_sample(0.025)
@@ -263,7 +264,7 @@ class score:
             data_dict['ref_points'] = pcd0.astype(np.float32)
             data_dict['ref_feats'] = np.ones((pcd0.shape[0], 1), dtype=np.float32)
             data_dict['src_feats'] = np.ones((pcd1.shape[0], 1), dtype=np.float32)
-            new_top_trans = []
+            """ new_top_trans = []
             for i in range(len(top_trans)):
                 single_trans = {
                     'trans':[],
@@ -284,35 +285,39 @@ class score:
                 single_trans['ir'] = overlap
                 new_top_trans.append(single_trans)
             new_top_trans = sorted(new_top_trans, key=lambda x:x["score"], reverse=True)
-            np.savez(f'{trans_dir}/{id0}-{id1}.npz',top_trans=new_top_trans)
-            """ score = 0
+            np.savez(f'{trans_dir}/{id0}-{id1}.npz',top_trans=new_top_trans) """
+            score = 0
             iter_time = 0
             trans_idx = 0
             save_trans = np.eye(4)
             save_score = 0
+            save_overlap = 0
+            # save_weight = 0
             while iter_time < self.cfg.max_time:
                 if trans_idx >= len(top_trans):break
                 trans = top_trans[trans_idx]['trans']
                 overlap = top_trans[trans_idx]['inlier_ratio']
-                pcd1 = transform_points(pcd1,trans)
-                data_dict['src_points'] = pcd1.astype(np.float32)
                 Rdiff = compute_R_diff(save_trans[0:3:,0:3],trans[0:3:,0:3])
                 tdiff = np.sqrt(np.sum(np.square(save_trans[0:3,3]-trans[0:3,3])))
                 trans_idx += 1
                 if iter_time > 0 and Rdiff < 10 and tdiff < 1:continue
+                pcd1 = transform_points(pcd1,trans)
+                data_dict['src_points'] = pcd1.astype(np.float32)
                 collated_dict = self.dict_pre(data_dict)
                 collated_dict = to_cuda(collated_dict)
-                torch.cuda.synchronize()
                 cls_logits = self.model(collated_dict)
-                torch.cuda.synchronize()
                 score = torch.sigmoid(cls_logits).detach().cpu().item()
+                # weight = score*overlap
                 torch.cuda.empty_cache()
                 if score > save_score:
                     save_trans = trans
                     save_score = score
+                    save_overlap = overlap
+                    # save_weight = weight
                 pcd1 = transform_points(pcd1, np.linalg.inv(trans))
                 iter_time += 1
-            np.savez(f'{trans_dir}/{id0}-{id1}.npz', trans=save_trans, overlap=overlap, score=save_score, iter_time=iter_time) """
+            np.savez(f'{trans_dir}/{id0}-{id1}.npz', trans=save_trans, score=save_score, 
+                     overlap=save_overlap, iter_time=iter_time)
 
 
 class evaluator:
@@ -329,7 +334,7 @@ class evaluator:
         for pair in tqdm(dataset.pair_ids):
             id0,id1=pair
             #match
-            matches=np.load(f'{self.cfg.output_cache_fn}/{dataset.name}/match_{self.cfg.max_iter}/{id0}-{id1}.npy')
+            matches=np.load(f'{self.cfg.output_cache_fn}/{dataset.name}/match_{self.cfg.keynum}/{id0}-{id1}.npy')
             keys0=np.load(f'{Keys_dir}/cloud_bin_{id0}Keypoints.npy')[matches[:,0],:]
             keys1=np.load(f'{Keys_dir}/cloud_bin_{id1}Keypoints.npy')[matches[:,1],:]
             #gt
@@ -378,13 +383,13 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--dataset',default='3dmatch',type=str,help='dataset name')
 parser.add_argument('--keynum',default=5000,type=int,help='number of key points')
 parser.add_argument('--max_iter',default=5000,type=int,help='calculate transformation iterations')
-parser.add_argument('--top_num',default=50,type=int,help='number of transformations contained')
-parser.add_argument('--max_time',default=5,type=int)
+parser.add_argument('--top_num',default=10,type=int,help='number of transformations contained')
+parser.add_argument('--max_time',default=10,type=int)
 parser.add_argument('--cal_trans_ird',default=0.1,type=float,help='inlier threshold of overlap calculation')
 parser.add_argument('--label_R_th',default=15,type=float,help='rotation threshold for ture label')
 parser.add_argument('--label_t_th',default=0.3,type=float,help='translation threshold for ture label')
 parser.add_argument('--score',action='store_true')
-parser.add_argument('--weight',default='./Score_geo/weights/weight.pth.tar',type=str)
+parser.add_argument('--weight',default='./Score_geo/weights/epoch-2.pth.tar',type=str)
 # dir parses
 base_dir='./data'
 parser.add_argument('--origin_data_dir',type=str,default=f"{base_dir}/origin_data")
@@ -417,7 +422,26 @@ if config.score:
         estmtor.RANSAC(dataset)
         print('Using Scorer-geo to score transformations.')
         scorer.score(dataset)
-        ir_trans_dir = f'{config.output_cache_fn}/{dataset.name}/ir_top_trans'
+        R_pre_log(dataset,f'{config.output_cache_fn}/{dataset.name}/score_top_trans')
+        print(f'eval the FMR result on {dataset.name}')
+        FMR,pair_fmrs=evaltor.Feature_match_Recall(dataset,ratio=config.fmr_ratio)
+        FMRS.append(FMR)
+        all_pair_fmrs.append(pair_fmrs)
+    FMRS=np.array(FMRS)
+    all_pair_fmrs=np.concatenate(all_pair_fmrs,axis=0)
+    #RR
+    datasetname=datasets['wholesetname']
+    Mean_Registration_Recall,c_flags,c_errors=RR_cal.benchmark(config,datasets,config.max_iter)
+    #print and save:
+    msg=f'{datasetname}-{config.max_iter}iterations\n'
+    msg+=f'correct ratio avg {np.mean(all_pair_fmrs):.5f}\n' \
+        f'correct ratio>0.05 avg {np.mean(FMRS):.5f}  std {np.std(FMRS):.5f}\n' \
+        f'Mean_Registration_Recall {Mean_Registration_Recall}\n'
+
+    with open('data/results.log','a') as f:
+        f.write(msg+'\n')
+    print(msg)
+    """ ir_trans_dir = f'{config.output_cache_fn}/{dataset.name}/ir_top_trans'
         score_trans_dir = f'{config.output_cache_fn}/{dataset.name}/score_top_trans'
         ir_scene_rre,ir_scene_rte = errorcal.error_cal(dataset,ir_trans_dir)
         score_scene_rre,score_scene_rte = errorcal.error_cal(dataset,score_trans_dir)
@@ -432,7 +456,7 @@ if config.score:
     writer.write(f'ir_rre\tir_rte\tscore_rre\tscore_rte\n')
     for i in range(ir_rre.shape[0]):
         writer.write(f'{ir_rre[i]}\t{ir_rte[i]}\t{score_rre[i]}\t{score_rte[i]}\n')
-    writer.close()
+    writer.close() """
 else:
     for scene,dataset in tqdm(datasets.items()):
         if scene=='wholesetname':continue
