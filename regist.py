@@ -4,17 +4,15 @@ import argparse
 from tqdm import tqdm
 from multiprocessing import Pool
 from functools import partial
-import sys,os
-import open3d as o3d
+import time,os
 from utils.utils import transform_points, make_non_exists_dir
-from utils.utils_o3d import make_open3d_point_cloud
 from utils.r_eval import compute_R_diff
 from dataops.dataset import get_dataset_name
 from utils.knn_search import knn_module
 import utils.RR_cal as RR_cal
 from Score_geo.utils.data import precompute_data_stack_mode
 from Score_geo.utils.torch import to_cuda
-from Score_geo.model import create_model
+from Score_geo.model import create_geo_model,create_score_model
 from Score_geo.config import make_cfg
 
 # match the feature
@@ -199,11 +197,18 @@ class estimator:
             self.cal_trans(dataset,match_dir,Save_dir,pair) """
         print(f'\nCalculating top {self.cfg.top_num} transformations in {self.cfg.max_iter} iters has done.')
 
-def load_snapshot(model, snapshot):
+def load_snapshot(geo_model,score_model, snapshot):
     print('Loading from "{}".'.format(snapshot))
     state_dict = torch.load(snapshot, map_location=torch.device('cpu'))
     assert 'model' in state_dict, 'No model can be loaded.'
-    model.load_state_dict(state_dict['model'], strict=True)
+    geo_params,score_params = {},{}
+    for key, value in state_dict['model'].items():
+        if key.startswith('backbone.') or key.startswith('transformer.'):
+            geo_params[key] = value
+        elif key.startswith('cls_head.'):
+            score_params[key] = value
+    geo_model.load_state_dict(geo_params, strict=True)
+    score_model.load_state_dict(score_params, strict=True)
     print('Model has been loaded.')
 
 class score:
@@ -212,9 +217,11 @@ class score:
         self.point_limit = 30000
         self.neighbor_limits = np.array([41, 36, 34, 15])
         model_cfg = make_cfg()
-        self.model = create_model(model_cfg).cuda()
-        load_snapshot(self.model,self.cfg.weight)
-        self.model.eval()
+        self.geo_model = create_geo_model(model_cfg).cuda()
+        self.score_model = create_score_model(model_cfg).cuda()
+        load_snapshot(self.geo_model,self.score_model,self.cfg.weight)
+        self.geo_model.eval()
+        self.score_model.eval()
 
     def dict_pre(self,data_dict):
         collated_dict = {}
@@ -242,7 +249,7 @@ class score:
 
     def score(self, dataset):
         Save_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/ir_top_trans'
-        trans_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/score_top_trans'
+        trans_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/weight_trans'
         make_non_exists_dir(trans_dir)
         for pair in tqdm(dataset.pair_ids):
             id0,id1=pair
@@ -262,9 +269,15 @@ class score:
                 pcd1 = pcd1[indices]
             data_dict = {}
             data_dict['ref_points'] = pcd0.astype(np.float32)
+            data_dict['src_points'] = pcd1.astype(np.float32)
             data_dict['ref_feats'] = np.ones((pcd0.shape[0], 1), dtype=np.float32)
             data_dict['src_feats'] = np.ones((pcd1.shape[0], 1), dtype=np.float32)
-            """ new_top_trans = []
+            collated_dict = self.dict_pre(data_dict)
+            collated_dict = to_cuda(collated_dict)
+            ref_feats_c_norm,src_feats_c_norm = self.geo_model(collated_dict)
+            """
+            # for top-10 score resort
+            new_top_trans = []
             for i in range(len(top_trans)):
                 single_trans = {
                     'trans':[],
@@ -292,30 +305,26 @@ class score:
             save_trans = np.eye(4)
             save_score = 0
             save_overlap = 0
-            # save_weight = 0
+            save_weight = 0
             while iter_time < self.cfg.max_time:
                 if trans_idx >= len(top_trans):break
                 trans = top_trans[trans_idx]['trans']
                 overlap = top_trans[trans_idx]['inlier_ratio']
-                Rdiff = compute_R_diff(save_trans[0:3:,0:3],trans[0:3:,0:3])
-                tdiff = np.sqrt(np.sum(np.square(save_trans[0:3,3]-trans[0:3,3])))
-                trans_idx += 1
-                if iter_time > 0 and Rdiff < 10 and tdiff < 1:continue
-                pcd1 = transform_points(pcd1,trans)
-                data_dict['src_points'] = pcd1.astype(np.float32)
-                collated_dict = self.dict_pre(data_dict)
-                collated_dict = to_cuda(collated_dict)
-                cls_logits = self.model(collated_dict)
+                trans_g = to_cuda(torch.from_numpy(trans))                
+                cls_logits = self.score_model(collated_dict,ref_feats_c_norm,src_feats_c_norm,trans_g)
                 score = torch.sigmoid(cls_logits).detach().cpu().item()
-                # weight = score*overlap
+                top_trans[trans_idx]['score'] = score
+                weight = score*overlap
                 torch.cuda.empty_cache()
-                if score > save_score:
+                # if score > save_score:
+                if weight > save_weight:
                     save_trans = trans
                     save_score = score
                     save_overlap = overlap
-                    # save_weight = weight
-                pcd1 = transform_points(pcd1, np.linalg.inv(trans))
+                    save_weight = weight
                 iter_time += 1
+                trans_idx += 1
+            np.savez(f'{Save_dir}/{id0}-{id1}.npz', top_trans=top_trans)
             np.savez(f'{trans_dir}/{id0}-{id1}.npz', trans=save_trans, score=save_score, 
                      overlap=save_overlap, iter_time=iter_time)
 
@@ -389,7 +398,7 @@ parser.add_argument('--cal_trans_ird',default=0.1,type=float,help='inlier thresh
 parser.add_argument('--label_R_th',default=15,type=float,help='rotation threshold for ture label')
 parser.add_argument('--label_t_th',default=0.3,type=float,help='translation threshold for ture label')
 parser.add_argument('--score',action='store_true')
-parser.add_argument('--weight',default='./Score_geo/weights/epoch-2.pth.tar',type=str)
+parser.add_argument('--weight',default='./Score_geo/weights/epoch-2-0.723.pth.tar',type=str)
 # dir parses
 base_dir='./data'
 parser.add_argument('--origin_data_dir',type=str,default=f"{base_dir}/origin_data")
@@ -406,12 +415,13 @@ if config.score:
     scorer = score(config)
 errorcal = calerror(config)
 
+t1 = time.time()
 datasets = get_dataset_name(config.dataset,config.origin_data_dir)
 FMRS=[]
 all_pair_fmrs=[]
 make_non_exists_dir(f'{config.output_cache_fn}/{config.dataset}')
-error_fn = f'{config.output_cache_fn}/{config.dataset}/{config.dataset}_error.log'
-writer = open(error_fn,'w')
+# error_fn = f'{config.output_cache_fn}/{config.dataset}/{config.dataset}_error.log'
+# writer = open(error_fn,'w')
 ir_rre,ir_rte = [],[]
 score_rre,score_rte = [],[]
 if config.score:
@@ -422,7 +432,7 @@ if config.score:
         estmtor.RANSAC(dataset)
         print('Using Scorer-geo to score transformations.')
         scorer.score(dataset)
-        R_pre_log(dataset,f'{config.output_cache_fn}/{dataset.name}/score_top_trans')
+        R_pre_log(dataset,f'{config.output_cache_fn}/{dataset.name}/weight_trans')
         print(f'eval the FMR result on {dataset.name}')
         FMR,pair_fmrs=evaltor.Feature_match_Recall(dataset,ratio=config.fmr_ratio)
         FMRS.append(FMR)
@@ -432,11 +442,14 @@ if config.score:
     #RR
     datasetname=datasets['wholesetname']
     Mean_Registration_Recall,c_flags,c_errors=RR_cal.benchmark(config,datasets,config.max_iter)
+    t2 = time.time()
+    t = t2-t1
     #print and save:
     msg=f'{datasetname}-{config.max_iter}iterations\n'
     msg+=f'correct ratio avg {np.mean(all_pair_fmrs):.5f}\n' \
         f'correct ratio>0.05 avg {np.mean(FMRS):.5f}  std {np.std(FMRS):.5f}\n' \
-        f'Mean_Registration_Recall {Mean_Registration_Recall}\n'
+        f'Mean_Registration_Recall {Mean_Registration_Recall}\n' \
+        f'time {t}\n'
 
     with open('data/results.log','a') as f:
         f.write(msg+'\n')
@@ -473,11 +486,14 @@ else:
     #RR
     datasetname=datasets['wholesetname']
     Mean_Registration_Recall,c_flags,c_errors=RR_cal.benchmark(config,datasets,config.max_iter)
+    t2 = time.time()
+    t = t2-t1
     #print and save:
     msg=f'{datasetname}-{config.max_iter}iterations\n'
     msg+=f'correct ratio avg {np.mean(all_pair_fmrs):.5f}\n' \
         f'correct ratio>0.05 avg {np.mean(FMRS):.5f}  std {np.std(FMRS):.5f}\n' \
-        f'Mean_Registration_Recall {Mean_Registration_Recall}\n'
+        f'Mean_Registration_Recall {Mean_Registration_Recall}\n' \
+        f'time {t}\n'
 
     with open('data/results.log','a') as f:
         f.write(msg+'\n')
