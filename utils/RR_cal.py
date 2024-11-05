@@ -340,8 +340,13 @@ def benchmark(cfg,datasets,max_iter):
         # mod = cfg.eval_mod
         # mod = mod.split('_')[-1]
         if cfg.score:
-            pre_dir=f'{cfg.output_cache_fn}/{dataset.name}/weight_trans'
+            if cfg.ir:
+                pre_dir=f'{cfg.output_cache_fn}/{dataset.name}/score*ir_trans'
+            else:
+                pre_dir=f'{cfg.output_cache_fn}/{dataset.name}/score_trans'
         else:
+            # pre_dir=f'{cfg.output_cache_fn}/{dataset.name}/ceiling_trans'
+            # pre_dir=f'{cfg.output_cache_fn}/{dataset.name}/ir_trans'
             pre_dir=f'{cfg.output_cache_fn}/{dataset.name}/trans'
         gt_dir_loc=str.rfind(dataset.gt_dir,'.')
         gt_dir=dataset.gt_dir[0:gt_dir_loc]

@@ -249,7 +249,10 @@ class score:
 
     def score(self, dataset):
         Save_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/ir_top_trans'
-        trans_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/weight_trans'
+        if self.cfg.ir:
+            trans_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/score*ir_trans'
+        else:
+            trans_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/score_trans'
         make_non_exists_dir(trans_dir)
         for pair in tqdm(dataset.pair_ids):
             id0,id1=pair
@@ -275,30 +278,7 @@ class score:
             collated_dict = self.dict_pre(data_dict)
             collated_dict = to_cuda(collated_dict)
             ref_feats_c_norm,src_feats_c_norm = self.geo_model(collated_dict)
-            """
-            # for top-10 score resort
-            new_top_trans = []
-            for i in range(len(top_trans)):
-                single_trans = {
-                    'trans':[],
-                    'score':float,
-                    'ir':float}
-                trans = top_trans[i]['trans']
-                overlap = top_trans[i]['inlier_ratio']
-                pcd1 = transform_points(pcd1,trans)
-                data_dict['src_points'] = pcd1.astype(np.float32)
-                collated_dict = self.dict_pre(data_dict)
-                collated_dict = to_cuda(collated_dict)
-                cls_logits = self.model(collated_dict)
-                score = torch.sigmoid(cls_logits).detach().cpu().item()
-                torch.cuda.empty_cache()
-                pcd1 = transform_points(pcd1, np.linalg.inv(trans))
-                single_trans['trans'] = trans
-                single_trans['score'] = score
-                single_trans['ir'] = overlap
-                new_top_trans.append(single_trans)
-            new_top_trans = sorted(new_top_trans, key=lambda x:x["score"], reverse=True)
-            np.savez(f'{trans_dir}/{id0}-{id1}.npz',top_trans=new_top_trans) """
+
             score = 0
             iter_time = 0
             trans_idx = 0
@@ -314,9 +294,11 @@ class score:
                 cls_logits = self.score_model(collated_dict,ref_feats_c_norm,src_feats_c_norm,trans_g)
                 score = torch.sigmoid(cls_logits).detach().cpu().item()
                 top_trans[trans_idx]['score'] = score
-                weight = score*overlap
+                if self.cfg.ir:
+                    weight = score*overlap
+                else:
+                    weight = score
                 torch.cuda.empty_cache()
-                # if score > save_score:
                 if weight > save_weight:
                     save_trans = trans
                     save_score = score
@@ -358,34 +340,6 @@ class evaluator:
         FMR=np.mean(pair_fmrs>ratio)                                #FMR in one scene
         return FMR, pair_fmrs
 
-class calerror:
-    def __init__(self,cfg):
-        self.cfg = cfg
-
-    def transdiff(self,gt,pre):
-        Rdiff = compute_R_diff(gt[0:3:,0:3:],pre[0:3:,0:3:])
-        tdiff = np.sqrt(np.sum(np.square(gt[0:3,3]-pre[0:3,3])))
-        return Rdiff,tdiff
-    
-    def error_cal(self,dataset,top_trans_dir):
-        scene_rre,scene_rte = [],[]
-        for pair in tqdm(dataset.pair_ids):
-            id0,id1 = pair
-            top_trans = np.load(f'{top_trans_dir}/{id0}-{id1}.npz',allow_pickle=True)['top_trans']
-            gt = dataset.get_transform(id0,id1)
-            top_rre,top_rte = [],[]
-            for i in range(len(top_trans)):
-                trans = top_trans[i]['trans']
-                Rdiff,tdiff = self.transdiff(gt,trans)
-                top_rre.append(Rdiff)
-                top_rte.append(tdiff)
-            scene_rre.append(top_rre)
-            scene_rte.append(top_rte)
-        scene_rre = np.array(scene_rre) #n,top_num
-        scene_rte = np.array(scene_rte)
-        rre = np.mean(scene_rre,axis=0)
-        rte = np.mean(scene_rte,axis=0)
-        return rre,rte
 
 parser = argparse.ArgumentParser()
 # registration parses
@@ -398,7 +352,8 @@ parser.add_argument('--cal_trans_ird',default=0.1,type=float,help='inlier thresh
 parser.add_argument('--label_R_th',default=15,type=float,help='rotation threshold for ture label')
 parser.add_argument('--label_t_th',default=0.3,type=float,help='translation threshold for ture label')
 parser.add_argument('--score',action='store_true')
-parser.add_argument('--weight',default='./Score_geo/weights/epoch-2-0.723.pth.tar',type=str)
+parser.add_argument('--ir',action='store_true')
+parser.add_argument('--weight',default='./Score_geo/weights/epoch-2.pth.tar',type=str)
 # dir parses
 base_dir='./data'
 parser.add_argument('--origin_data_dir',type=str,default=f"{base_dir}/origin_data")
@@ -420,10 +375,6 @@ datasets = get_dataset_name(config.dataset,config.origin_data_dir)
 FMRS=[]
 all_pair_fmrs=[]
 make_non_exists_dir(f'{config.output_cache_fn}/{config.dataset}')
-# error_fn = f'{config.output_cache_fn}/{config.dataset}/{config.dataset}_error.log'
-# writer = open(error_fn,'w')
-ir_rre,ir_rte = [],[]
-score_rre,score_rte = [],[]
 if config.score:
     for scene,dataset in tqdm(datasets.items()):
         if scene=='wholesetname':continue
@@ -432,7 +383,10 @@ if config.score:
         estmtor.RANSAC(dataset)
         print('Using Scorer-geo to score transformations.')
         scorer.score(dataset)
-        R_pre_log(dataset,f'{config.output_cache_fn}/{dataset.name}/weight_trans')
+        if config.ir:
+            R_pre_log(dataset,f'{config.output_cache_fn}/{dataset.name}/score*ir_trans')
+        else:
+            R_pre_log(dataset,f'{config.output_cache_fn}/{dataset.name}/score_trans')
         print(f'eval the FMR result on {dataset.name}')
         FMR,pair_fmrs=evaltor.Feature_match_Recall(dataset,ratio=config.fmr_ratio)
         FMRS.append(FMR)
@@ -454,22 +408,6 @@ if config.score:
     with open('data/results.log','a') as f:
         f.write(msg+'\n')
     print(msg)
-    """ ir_trans_dir = f'{config.output_cache_fn}/{dataset.name}/ir_top_trans'
-        score_trans_dir = f'{config.output_cache_fn}/{dataset.name}/score_top_trans'
-        ir_scene_rre,ir_scene_rte = errorcal.error_cal(dataset,ir_trans_dir)
-        score_scene_rre,score_scene_rte = errorcal.error_cal(dataset,score_trans_dir)
-        ir_rre.append(ir_scene_rre)
-        ir_rte.append(ir_scene_rte)
-        score_rre.append(score_scene_rre)
-        score_rte.append(score_scene_rte)
-    ir_rre = np.mean(np.array(ir_rre),axis=0)
-    ir_rte = np.mean(np.array(ir_rte),axis=0)
-    score_rre = np.mean(np.array(score_rre),axis=0)
-    score_rte = np.mean(np.array(score_rte),axis=0)
-    writer.write(f'ir_rre\tir_rte\tscore_rre\tscore_rte\n')
-    for i in range(ir_rre.shape[0]):
-        writer.write(f'{ir_rre[i]}\t{ir_rte[i]}\t{score_rre[i]}\t{score_rte[i]}\n')
-    writer.close() """
 else:
     for scene,dataset in tqdm(datasets.items()):
         if scene=='wholesetname':continue
