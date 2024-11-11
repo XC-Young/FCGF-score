@@ -148,6 +148,13 @@ class estimator:
                         if single_trans['inlier_ratio'] > top_trans[i]['inlier_ratio']:
                             top_trans[i] = single_trans
                             break
+            """ # for visual selection
+            gt = dataset.get_transform(id0,id1)
+            for i in range(len(top_trans)):
+                trans = top_trans[i]['trans']
+                Rdiff,tdiff = self.transdiff(gt,trans)
+                top_trans[i]['rre'] = Rdiff
+                top_trans[i]['rte'] = tdiff """
             top_trans = sorted(top_trans, key=lambda x:x["inlier_ratio"], reverse=True)
             np.savez(f'{Save_dir}/{id0}-{id1}.npz',top_trans=top_trans)
         else:
@@ -253,6 +260,9 @@ class score:
             trans_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/score*ir_trans'
         else:
             trans_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/score_trans'
+        # for feature vector check
+        # vector_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/feat_vectors'
+        # make_non_exists_dir(vector_dir)
         make_non_exists_dir(trans_dir)
         for pair in tqdm(dataset.pair_ids):
             id0,id1=pair
@@ -292,6 +302,11 @@ class score:
                 overlap = top_trans[trans_idx]['inlier_ratio']
                 trans_g = to_cuda(torch.from_numpy(trans))                
                 cls_logits = self.score_model(collated_dict,ref_feats_c_norm,src_feats_c_norm,trans_g)
+                # for feature vector check
+                # dist_v = dist_v.detach().cpu().numpy()
+                # feat_v = feat_v.detach().cpu().numpy()
+                # np.save(f'{vector_dir}/{id0}-{id1}-{trans_idx}_dist.npy',dist_v)
+                # np.save(f'{vector_dir}/{id0}-{id1}-{trans_idx}_feat.npy',feat_v)
                 score = torch.sigmoid(cls_logits).detach().cpu().item()
                 top_trans[trans_idx]['score'] = score
                 if self.cfg.ir:
@@ -347,7 +362,7 @@ parser.add_argument('--dataset',default='3dmatch',type=str,help='dataset name')
 parser.add_argument('--keynum',default=5000,type=int,help='number of key points')
 parser.add_argument('--max_iter',default=5000,type=int,help='calculate transformation iterations')
 parser.add_argument('--top_num',default=10,type=int,help='number of transformations contained')
-parser.add_argument('--max_time',default=10,type=int)
+parser.add_argument('--max_time',default=11,type=int)
 parser.add_argument('--cal_trans_ird',default=0.1,type=float,help='inlier threshold of overlap calculation')
 parser.add_argument('--label_R_th',default=15,type=float,help='rotation threshold for ture label')
 parser.add_argument('--label_t_th',default=0.3,type=float,help='translation threshold for ture label')
@@ -368,7 +383,6 @@ estmtor = estimator(config)
 evaltor = evaluator(config)
 if config.score:
     scorer = score(config)
-errorcal = calerror(config)
 
 t1 = time.time()
 datasets = get_dataset_name(config.dataset,config.origin_data_dir)
