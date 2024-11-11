@@ -67,6 +67,27 @@ def apply_transform_tensor(points: torch.Tensor, transform: torch.Tensor, normal
         return points, normals
     else:
         return points
+def apply_transform_tensor_para(point_cloud, transformations):
+    """
+    Efficiently apply multiple transformations to a point cloud using PyTorch tensors.
+
+    Parameters:
+    - point_cloud: torch.Tensor of shape (l, 3), where l is the number of points.
+    - transformations: torch.Tensor of shape (n, 4, 4), where n is the number of transformations.
+
+    Returns:
+    - transformed_points: torch.Tensor of shape (n, l, 3), containing the transformed point clouds.
+    """
+    num_points = point_cloud.shape[0]
+    
+    # Expand point cloud to match transformation dimensions and add homogeneous coordinates
+    homogeneous_points = torch.cat([point_cloud, torch.ones((num_points, 1), device=point_cloud.device)], dim=1)
+    homogeneous_points = homogeneous_points.unsqueeze(0).expand(transformations.shape[0], -1, -1)
+    
+    # Batch matrix multiplication for all transformations at once
+    transformed_points = torch.bmm(homogeneous_points, transformations.transpose(1, 2))[:, :, :3]
+    
+    return transformed_points
 
 def compose_transforms(transforms: List[np.ndarray]) -> np.ndarray:
     r"""
