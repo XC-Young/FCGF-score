@@ -5,6 +5,7 @@ from tqdm import tqdm
 from multiprocessing import Pool
 from functools import partial
 import time,os
+import open3d as o3d
 from utils.utils import transform_points, make_non_exists_dir
 from utils.r_eval import compute_R_diff
 from dataops.dataset import get_dataset_name
@@ -21,7 +22,7 @@ class matcher():
         self.cfg = cfg
         self.KNN = knn_module.KNN(1)
 
-    def run(self,dataset,keynum=5000):
+    def run(self,dataset,keynum):
         if dataset.name[0:4]=='3dLo':
             datasetname = f'3d{dataset.name[4:]}'
         else:
@@ -106,6 +107,37 @@ class estimator:
         inlier_ratio = np.mean(diff<self.inlier_dist*self.inlier_dist)
         return inlier_ratio,ir_idx
     
+    def mse_cal(self,key_m0,key_m1,T):
+        key_m1 = transform_points(key_m1,T)
+        mse = np.mean(np.sum(np.square(key_m0-key_m1),axis=-1))
+        return mse
+    
+    def mae_cal(self,key_m0,key_m1,T):
+        key_m1 = transform_points(key_m1,T)
+        mae = np.mean(np.sum(np.abs(key_m0-key_m1),axis=-1))
+        return mae
+    
+    def chamfer_dist_cal(key_m0,key_m1,T):
+        key_m1 = transform_points(key_m1,T)
+        pc0 = o3d.geometry.PointCloud()
+        pc1 = o3d.geometry.PointCloud()
+        pc0.points = o3d.utility.Vector3dVector(key_m0)
+        pc1.points = o3d.utility.Vector3dVector(key_m1)
+        kdtree0 = o3d.geometry.KDTreeFlann(pc0)
+        kdtree1 = o3d.geometry.KDTreeFlann(pc1)
+        chamfer_distance_0to1 = 0.0
+        chamfer_distance_1to0 = 0.0
+        for point in key_m0:
+            _, idx, _ = kdtree1.search_knn_vector_3d(point, 1)
+            chamfer_distance_0to1 += np.linalg.norm(point - key_m1[idx[0]])
+        for point in key_m1:
+            _, idx, _ = kdtree0.search_knn_vector_3d(point, 1)
+            chamfer_distance_1to0 += np.linalg.norm(point - key_m0[idx[0]])
+
+        chamfer_distance = chamfer_distance_0to1 / len(key_m0) + chamfer_distance_1to0 / len(key_m1)
+        return chamfer_distance
+
+
     def transdiff(self,gt,pre):
         Rdiff = compute_R_diff(gt[0:3:,0:3:],pre[0:3:,0:3:])
         tdiff = np.sqrt(np.sum(np.square(gt[0:3,3]-pre[0:3,3])))
@@ -128,6 +160,7 @@ class estimator:
         label = 0
         if self.cfg.score:
             top_trans = []
+            # ir
             while iter_cal<self.cfg.max_iter:
                 single_trans = {
                     'trans':[],
@@ -157,6 +190,31 @@ class estimator:
                 top_trans[i]['rte'] = tdiff """
             top_trans = sorted(top_trans, key=lambda x:x["inlier_ratio"], reverse=True)
             np.savez(f'{Save_dir}/{id0}-{id1}.npz',top_trans=top_trans)
+            # MSE MAE Chamfer_dist
+            """ while iter_cal<self.cfg.max_iter:
+                single_trans = {
+                    'trans':[],
+                    'chd':float}
+                iter_cal += 1
+                idxs_init = np.random.choice(range(Keys_m0.shape[0]),3)
+                kps0_init = Keys_m0[idxs_init]
+                kps1_init = Keys_m1[idxs_init]
+
+                trans = self.Threepps2Trans(kps0_init,kps1_init)
+                # mse = self.mse_cal(Keys_m0,Keys_m1,trans)
+                # mae = self.mae_cal(Keys_m0,Keys_m1,trans)
+                chd = self.chamfer_dist_cal(Keys_m0,Keys_m1,trans)
+                single_trans['trans'] = trans
+                single_trans['chd'] = chd
+                if iter_cal <= self.cfg.top_num:
+                    top_trans.append(single_trans)
+                else:
+                    for i in range(self.cfg.top_num):
+                        if single_trans['chd'] < top_trans[i]['chd']:
+                            top_trans[i] = single_trans
+                            break      
+            top_trans = sorted(top_trans, key=lambda x:x["chd"])
+            np.savez(f'{Save_dir}/{id0}-{id1}.npz',top_trans=top_trans) """
         else:
             while iter_cal<self.cfg.max_iter:
                 iter_cal += 1
@@ -187,6 +245,7 @@ class estimator:
         match_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/match_{self.cfg.keynum}'
         if self.cfg.score:
             Save_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/ir_top_trans'
+            # Save_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/chd_top_trans'
         else:
             Save_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/trans'
         make_non_exists_dir(Save_dir)
@@ -223,6 +282,7 @@ class score:
         self.cfg = cfg
         self.point_limit = 30000
         self.neighbor_limits = np.array([41, 36, 34, 15])
+        self.voxel_size = cfg.score_voxel
         model_cfg = make_cfg()
         self.geo_model = create_geo_model(model_cfg).cuda()
         self.score_model = create_score_model(model_cfg).cuda()
@@ -249,17 +309,14 @@ class score:
         for key, value in collated_dict.items():
             collated_dict[key] = value[0]
         collated_dict['features'] = feats
-        input_dict = precompute_data_stack_mode(points, lengths, num_stages=4, voxel_size=0.025, 
+        input_dict = precompute_data_stack_mode(points, lengths, num_stages=4, voxel_size=self.voxel_size, 
                                                 radius=0.0625, neighbor_limits = self.neighbor_limits, point_num=128)
         collated_dict.update(input_dict)
         return(collated_dict)
 
     def score(self, dataset):
         Save_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/ir_top_trans'
-        if self.cfg.ir:
-            trans_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/score*ir_trans'
-        else:
-            trans_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/score_trans'
+        trans_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/score_trans'
         # for feature vector check
         # vector_dir = f'{self.cfg.output_cache_fn}/{dataset.name}/feat_vectors'
         # make_non_exists_dir(vector_dir)
@@ -269,13 +326,13 @@ class score:
             if os.path.exists(f'{trans_dir}/{id0}-{id1}.npz'):continue
             top_trans = np.load(f'{Save_dir}/{id0}-{id1}.npz',allow_pickle=True)['top_trans']
             pcd0 = dataset.get_pc_o3d(id0)
-            pcd0 = pcd0.voxel_down_sample(0.025)
+            pcd0 = pcd0.voxel_down_sample(self.voxel_size)
             pcd0 = np.array(pcd0.points)
             if pcd0.shape[0] > self.point_limit:
                 indices = np.random.permutation(pcd0.shape[0])[: self.point_limit]
                 pcd0 = pcd0[indices]
             pcd1 = dataset.get_pc_o3d(id1)
-            pcd1 = pcd1.voxel_down_sample(0.025)
+            pcd1 = pcd1.voxel_down_sample(self.voxel_size)
             pcd1 = np.array(pcd1.points)
             if pcd1.shape[0] > self.point_limit:
                 indices = np.random.permutation(pcd1.shape[0])[: self.point_limit]
@@ -295,7 +352,6 @@ class score:
             save_trans = np.eye(4)
             save_score = 0
             save_overlap = 0
-            save_weight = 0
             while iter_time < self.cfg.max_time:
                 if trans_idx >= len(top_trans):break
                 trans = top_trans[trans_idx]['trans']
@@ -309,16 +365,11 @@ class score:
                 # np.save(f'{vector_dir}/{id0}-{id1}-{trans_idx}_feat.npy',feat_v)
                 score = torch.sigmoid(cls_logits).detach().cpu().item()
                 top_trans[trans_idx]['score'] = score
-                if self.cfg.ir:
-                    weight = score*overlap
-                else:
-                    weight = score
                 torch.cuda.empty_cache()
-                if weight > save_weight:
+                if score > save_score:
                     save_trans = trans
                     save_score = score
                     save_overlap = overlap
-                    save_weight = weight
                 iter_time += 1
                 trans_idx += 1
             np.savez(f'{Save_dir}/{id0}-{id1}.npz', top_trans=top_trans)
@@ -354,6 +405,49 @@ class evaluator:
         pair_fmrs=np.array(pair_fmrs)                               #ok ratios in one scene
         FMR=np.mean(pair_fmrs>ratio)                                #FMR in one scene
         return FMR, pair_fmrs
+    
+class error_eval:
+    def __init__(self, cfg):
+        self.cfg = cfg
+    def cal_error(self, datasets):
+        recall,rre,rte = [],[],[]
+        if self.cfg.ir:
+            msg = f'{config.dataset}-ir\n'
+        else:
+            msg = f'{config.dataset}-score\n'
+        for scene,dataset in tqdm(datasets.items()):
+            if scene=='wholesetname':continue
+            ok_num = 0
+            scene_rre,scene_rte = [],[]
+            for pair in tqdm(dataset.pair_ids):
+                id0,id1=pair
+                gt=dataset.get_transform(id0,id1)
+                if self.cfg.ir:
+                    top_trans = np.load(f'{self.cfg.output_cache_fn}/{dataset.name}/ir_top_trans/{id0}-{id1}.npz',allow_pickle=True)['top_trans']
+                    pre = top_trans[0]['trans']
+                else:
+                    pre=np.load(f'{self.cfg.output_cache_fn}/{dataset.name}/score_trans/{id0}-{id1}.npz')['trans']
+                Rdiff = compute_R_diff(gt[0:3,0:3],pre[0:3,0:3])
+                tdiff = np.linalg.norm(pre[0:3,-1]-gt[0:3,-1])
+                if Rdiff<=self.cfg.label_R_th and tdiff<=self.cfg.label_t_th:
+                    ok_num += 1
+                    scene_rre.append(Rdiff)
+                    scene_rte.append(tdiff)
+            scene_recall = ok_num/len(dataset.pair_ids)
+            scene_rre = np.mean(np.array(scene_rre))
+            scene_rte = np.mean(np.array(scene_rte))
+            msg += f'{scene}\trecall:{scene_recall:.4f}\tRRE:{scene_rre:.4f}\tRTE:{scene_rte:.4f}\n'
+            recall.append(scene_recall)
+            rre.append(scene_rre)
+            rte.append(scene_rte)
+        recall = np.mean(np.array(recall))
+        rre = np.mean(np.array(rre))
+        rte = np.mean(np.array(rte))
+        msg += f'Recall:{recall:.4f}\nRRE:{rre:.4f}\nRTE:{rte:.4f}\n'
+        with open(f'{self.cfg.output_cache_fn}/{self.cfg.dataset}/result.log','a') as f:
+            f.write(msg)
+        print(msg)
+
 
 
 parser = argparse.ArgumentParser()
@@ -369,18 +463,20 @@ parser.add_argument('--label_t_th',default=0.3,type=float,help='translation thre
 parser.add_argument('--score',action='store_true')
 parser.add_argument('--ir',action='store_true')
 parser.add_argument('--weight',default='./Score_geo/weights/epoch-2.pth.tar',type=str)
+parser.add_argument('--score_voxel',default=0.025,type=float)
 # dir parses
 base_dir='./data'
 parser.add_argument('--origin_data_dir',type=str,default=f"{base_dir}/origin_data")
 parser.add_argument('--output_cache_fn',type=str,default=f'{base_dir}/FCGF_Reg')
 # eval parses
-parser.add_argument('--fmr_ratio',default=0.05)
-parser.add_argument('--RR_dist_th',default=0.2)
+parser.add_argument('--fmr_ratio',default=0.05,type=float)
+parser.add_argument('--RR_dist_th',default=0.2,type=float)
 config = parser.parse_args()
 
 matcer = matcher(config)
 estmtor = estimator(config)
 evaltor = evaluator(config)
+error_evaltor = error_eval(config)
 if config.score:
     scorer = score(config)
 
@@ -397,10 +493,7 @@ if config.score:
         estmtor.RANSAC(dataset)
         print('Using Scorer-geo to score transformations.')
         scorer.score(dataset)
-        if config.ir:
-            R_pre_log(dataset,f'{config.output_cache_fn}/{dataset.name}/score*ir_trans')
-        else:
-            R_pre_log(dataset,f'{config.output_cache_fn}/{dataset.name}/score_trans')
+        R_pre_log(dataset,f'{config.output_cache_fn}/{dataset.name}/score_trans')
         print(f'eval the FMR result on {dataset.name}')
         FMR,pair_fmrs=evaltor.Feature_match_Recall(dataset,ratio=config.fmr_ratio)
         FMRS.append(FMR)
@@ -408,20 +501,23 @@ if config.score:
     FMRS=np.array(FMRS)
     all_pair_fmrs=np.concatenate(all_pair_fmrs,axis=0)
     #RR
-    datasetname=datasets['wholesetname']
-    Mean_Registration_Recall,c_flags,c_errors=RR_cal.benchmark(config,datasets,config.max_iter)
-    t2 = time.time()
-    t = t2-t1
-    #print and save:
-    msg=f'{datasetname}-{config.max_iter}iterations\n'
-    msg+=f'correct ratio avg {np.mean(all_pair_fmrs):.5f}\n' \
-        f'correct ratio>0.05 avg {np.mean(FMRS):.5f}  std {np.std(FMRS):.5f}\n' \
-        f'Mean_Registration_Recall {Mean_Registration_Recall}\n' \
-        f'time {t}\n'
+    if config.dataset == 'scannet':
+        error_evaltor.cal_error(datasets)
+    else:
+        datasetname=datasets['wholesetname']
+        Mean_Registration_Recall,c_flags,c_errors=RR_cal.benchmark(config,datasets,config.max_iter)
+        t2 = time.time()
+        t = t2-t1
+        #print and save:
+        msg=f'{datasetname}-score-{config.max_iter}iterations\n'
+        msg+=f'correct ratio avg {np.mean(all_pair_fmrs):.5f}\n' \
+            f'correct ratio>0.05 avg {np.mean(FMRS):.5f}  std {np.std(FMRS):.5f}\n' \
+            f'Mean_Registration_Recall {Mean_Registration_Recall}\n' \
+            f'time {t}\n'
 
-    with open('data/results.log','a') as f:
-        f.write(msg+'\n')
-    print(msg)
+        with open('data/results.log','a') as f:
+            f.write(msg+'\n')
+        print(msg)
 else:
     for scene,dataset in tqdm(datasets.items()):
         if scene=='wholesetname':continue

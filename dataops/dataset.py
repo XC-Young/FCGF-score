@@ -200,6 +200,25 @@ def get_dataset_name(dataset_name,origin_data_dir):
             datasets[scenes[i]].name=f'{dataset_name}/{scenes[i]}'
         return datasets
 
+    if dataset_name=='scannet':
+        datasets={}
+        datasets['wholesetname']=f'{dataset_name}'
+        scenes=["scene0197_01","scene0030_02","scene0406_02","scene0694_00",
+                "scene0701_01","scene0457_01","scene0208_00","scene0578_01",
+                "scene0286_02","scene0569_00","scene0309_00","scene0265_02",
+                "scene0588_02","scene0474_01","scene0477_01","scene0334_02",
+                "scene0353_00","scene0043_00","scene0224_00","scene0661_00",
+                "scene0335_02","scene0231_01","scene0025_01","scene0642_02",
+                "scene0493_01","scene0057_01","scene0575_02","scene0146_02",
+                "scene0223_00","scene0262_01","scene0229_01","scene0676_01"]
+        stationnums=[30]*len(scenes)
+        for i in range(len(scenes)):
+            root_dir=f'{origin_data_dir}/scannet/'+scenes[i]
+            gt_dir=f'{root_dir}/PointCloud/gt_pair.log'
+            datasets[scenes[i]]=ThrDMatchPartDataset(root_dir,stationnums[i],gt_dir)
+            datasets[scenes[i]].name=f'{dataset_name}/{scenes[i]}'
+        return datasets
+
     if dataset_name=='3dmatch_val':
         datasets={}
         datasets['wholesetname']=f'{dataset_name}'
